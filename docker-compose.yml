@@ -1,0 +1,167 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # KVCache+动态压缩大模型代理服务
+  # ==========================================
+  kvcache-dynamic-proxy:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 基础配置
+      - API_KEY=${API_KEY}
+      - TARGET_URL=${TARGET_URL:-https://api.openai.com/v1}
+      - BACKEND_TYPE=${BACKEND_TYPE:-openai}
+      
+      # 压缩配置
+      - ENABLE_COMPRESSION=${ENABLE_COMPRESSION:-true}
+      - MEMORIES_TARGET=${MEMORIES_TARGET:-1500}
+      - HISTORY_TARGET=${HISTORY_TARGET:-1000}
+      - HISTORY_KEEP_LAST_N=${HISTORY_KEEP_LAST_N:-4}
+      
+      # KV Cache 配置
+      - ENABLE_KV_CACHE=${ENABLE_KV_CACHE:-true}
+      - KV_CACHE_SIZE=${KV_CACHE_SIZE:-1000}
+      - KV_CACHE_TTL=${KV_CACHE_TTL:-3600}
+      
+      # 后端特定配置
+      - VLLM_PREFIX_CACHING=${VLLM_PREFIX_CACHING:-true}
+      - SGLANG_RADIX_CACHE=${SGLANG_RADIX_CACHE:-true}
+      - LMDEPLOY_CACHE_ENTRIES=${LMDEPLOY_CACHE_ENTRIES:-1000}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+  # ==========================================
+  # 可选: vLLM 后端 (带 prefix caching)
+  # ==========================================
+  vllm-backend:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - ${MODEL_PATH:-/models}:/models
+    environment:
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+    command: >
+      --model ${VLLM_MODEL:-/models/llama-2-7b}
+      --enable-prefix-caching
+      --max-num-seqs 256
+      --tensor-parallel-size 1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - vllm
+      
+  # ==========================================
+  # 可选: SGLang 后端 (带 RadixAttention)
+  # ==========================================
+  sglang-backend:
+    image: lmsysorg/sglang:latest
+    ports:
+      - "8002:30000"
+    volumes:
+      - ${MODEL_PATH:-/models}:/models
+    command: >
+      python -m sglang.launch_server
+      --model-path ${SGLANG_MODEL:-/models/llama-2-7b}
+      --port 30000
+      --enable-radix-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - sglang
+      
+  # ==========================================
+  # 可选: LMDeploy 后端
+  # ==========================================
+  lmdeploy-backend:
+    image: openmmlab/lmdeploy:latest
+    ports:
+      - "8003:23333"
+    volumes:
+      - ${MODEL_PATH:-/models}:/models
+    command: >
+      lmdeploy serve api_server
+      /models/${LMDEPLOY_MODEL:-llama-2-7b}
+      --server-port 23333
+      --tp 1
+      --cache-max-entry-count 0.8
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - lmdeploy
+  
+  # ==========================================
+  # 可选：Prometheus 监控
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    profiles:
+      - monitoring
+    
+  # ==========================================
+  # 可选：Grafana 可视化
+  # ==========================================
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    profiles:
+      - monitoring
+
+# ==========================================
+# Docker Compose Profiles 使用指南
+# ==========================================
+#
+# 1. 使用 OpenAI (默认):
+#    docker-compose up -d
+#
+# 2. 使用 vLLM:
+#    export MODEL_PATH=/path/to/models
+#    docker-compose --profile vllm up -d
+#
+# 3. 使用 SGLang:
+#    export MODEL_PATH=/path/to/models
+#    docker-compose --profile sglang up -d
+#
+# 4. 使用 LMDeploy:
+#    export MODEL_PATH=/path/to/models
+#    docker-compose --profile lmdeploy up -d
+#
+# 5. 完整监控:
+#    docker-compose --profile monitoring up -d
+#
+# ==========================================
+
+volumes:
+  grafana-data:
