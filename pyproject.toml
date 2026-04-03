@@ -41,7 +41,7 @@ dev = [
 ]
 
 [project.scripts]
-compress-text-proxy = "compress_text_proxy.server:main"
+kvcache-proxy = "compress_text_proxy.server:main"
 
 [project.urls]
 Homepage = "https://github.com/waveman800/KVCacheDynamicCompressionLLMProxy"

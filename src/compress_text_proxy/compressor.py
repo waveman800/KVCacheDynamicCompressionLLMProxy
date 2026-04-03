@@ -55,6 +55,13 @@ class TokenCounter:
         return total
 
 
+class GranularityLevel:
+    """压缩粒度级别"""
+    FULL = "full"       # 整个记忆项
+    PARAGRAPH = "paragraph"  # 按段落
+    SENTENCE = "sentence"    # 按句子
+
+
 class DynamicCompressor:
     """
     动态上下文压缩器
@@ -64,18 +71,36 @@ class DynamicCompressor:
     2. 关键词匹配
     3. 位置权重
     4. 相似度去重
+    5. 细粒度段落/句子压缩
     """
     
     def __init__(
         self,
         session_len: int = 8192,
         similarity_threshold: float = 0.55,
-        use_fast_mode: bool = False
+        use_fast_mode: bool = False,
+        granularity: str = "paragraph",
+        min_keep_segments: int = 1,
+        keyword_weight: float = 0.4,
+        tfidf_weight: float = 0.3,
+        position_weight: float = 0.2,
+        query_weight: float = 0.1
     ):
         self.session_len = session_len
         self.similarity_threshold = similarity_threshold
         self.use_fast_mode = use_fast_mode
+        self.granularity = granularity
+        self.min_keep_segments = min_keep_segments
         self.token_counter = TokenCounter()
+        
+        # 权重配置（合并后：内容重要性 + 位置 + 查询）
+        self.content_importance_weight = keyword_weight + tfidf_weight  # 兼容旧配置
+        self.position_weight = position_weight
+        self.query_weight = query_weight
+        
+        # 内容重要性内部比例：关键词 60% + TF-IDF 40%
+        self._keyword_internal_ratio = 0.6
+        self._tfidf_internal_ratio = 0.4
         
         # 关键词列表
         self.keywords = [
@@ -93,7 +118,7 @@ class DynamicCompressor:
         query: str = ""
     ) -> CompressionResult:
         """
-        压缩记忆列表
+        压缩记忆列表（支持细粒度段落/句子压缩）
         
         Args:
             memories: 记忆列表
@@ -118,52 +143,58 @@ class DynamicCompressor:
                 memories, original_tokens, original_tokens, False, 0.0, 1.0, 0.0
             )
         
-        # 计算每个记忆的重要性
+        # 细粒度模式：对每个记忆项内部进行段落/句子压缩
+        if self.granularity in (GranularityLevel.PARAGRAPH, GranularityLevel.SENTENCE):
+            return self._compress_memories_granular(memories, max_tokens, query, original_tokens, start_time)
+        
+        # 粗粒度模式：整个记忆项级别压缩
+        return self._compress_memories_full(memories, max_tokens, query, original_tokens, start_time)
+    
+    def _compress_memories_full(
+        self,
+        memories: List[str],
+        max_tokens: int,
+        query: str,
+        original_tokens: int,
+        start_time: float
+    ) -> CompressionResult:
+        """完整记忆项级别压缩"""
         scored_memories = []
         for i, mem in enumerate(memories):
             score = self._calculate_importance(mem, i, len(memories), query)
             scored_memories.append((score, mem))
         
-        # 按重要性排序
         scored_memories.sort(key=lambda x: x[0], reverse=True)
         
-        # 选择最重要的记忆，直到达到 token 限制
         selected = []
         current_tokens = 0
-        
-        # 首先保留最重要的 min_keep 个
         min_keep = min(3, len(scored_memories))
+        
         for i in range(min_keep):
             mem = scored_memories[i][1]
             mem_tokens = self.token_counter.count_tokens(mem)
             selected.append(mem)
             current_tokens += mem_tokens
         
-        # 然后按重要性添加其他记忆
         for score, mem in scored_memories[min_keep:]:
             mem_tokens = self.token_counter.count_tokens(mem)
             if current_tokens + mem_tokens <= max_tokens:
                 selected.append(mem)
                 current_tokens += mem_tokens
             else:
-                # 尝试截断
                 remaining = max_tokens - current_tokens
-                if remaining > 50:  # 至少还能加 50 tokens
-                    truncated = self._truncate_text(mem, remaining)
+                if remaining > 50:
+                    truncated = self._truncate_text_to_tokens(mem, remaining)
                     if truncated:
                         selected.append(truncated + "...")
                         current_tokens += self.token_counter.count_tokens(truncated)
                 break
         
-        # 恢复原始顺序
         selected_set = set(selected)
         result = [m for m in memories if m in selected_set]
-        
         compressed_tokens = self.token_counter.count_tokens("\n\n".join(result))
         processing_time = (time.time() - start_time) * 1000
-        
         ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
-        savings = (1 - ratio) * 100
         
         return CompressionResult(
             content=result,
@@ -172,7 +203,68 @@ class DynamicCompressor:
             was_compressed=len(result) < len(memories) or compressed_tokens < original_tokens,
             processing_time_ms=processing_time,
             compression_ratio=ratio,
-            savings_percentage=savings
+            savings_percentage=(1 - ratio) * 100
+        )
+    
+    def _compress_memories_granular(
+        self,
+        memories: List[str],
+        max_tokens: int,
+        query: str,
+        original_tokens: int,
+        start_time: float
+    ) -> CompressionResult:
+        """细粒度段落/句子级别压缩"""
+        memory_scores = []
+        for i, mem in enumerate(memories):
+            score = self._calculate_importance(mem, i, len(memories), query)
+            mem_tokens = self.token_counter.count_tokens(mem)
+            memory_scores.append({'text': mem, 'score': score, 'tokens': mem_tokens, 'index': i})
+        
+        memory_scores.sort(key=lambda x: x['score'], reverse=True)
+        
+        selected_memories = []
+        current_tokens = 0
+        total_segments_kept = 0
+        
+        for mem_info in memory_scores:
+            if current_tokens >= max_tokens:
+                break
+            
+            remaining_budget = max_tokens - current_tokens
+            
+            if mem_info['tokens'] <= remaining_budget:
+                selected_memories.append(mem_info)
+                current_tokens += mem_info['tokens']
+            else:
+                compressed_text, orig_tokens, comp_tokens = self._compress_text_granular(
+                    mem_info['text'], remaining_budget, query
+                )
+                if comp_tokens > 0:
+                    selected_memories.append({
+                        'text': compressed_text,
+                        'score': mem_info['score'],
+                        'tokens': comp_tokens,
+                        'index': mem_info['index'],
+                        'compressed': True
+                    })
+                    current_tokens += comp_tokens
+                    total_segments_kept += 1
+        
+        selected_memories.sort(key=lambda x: x['index'])
+        result = [m['text'] for m in selected_memories]
+        compressed_tokens = self.token_counter.count_tokens("\n\n".join(result))
+        processing_time = (time.time() - start_time) * 1000
+        ratio = compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+        
+        return CompressionResult(
+            content=result,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            was_compressed=True,
+            processing_time_ms=processing_time,
+            compression_ratio=ratio,
+            savings_percentage=(1 - ratio) * 100
         )
     
     def compress_chat_history(
@@ -234,6 +326,34 @@ class DynamicCompressor:
             savings_percentage=savings
         )
     
+    def _split_text(self, text: str) -> List[Tuple[str, int, int]]:
+        """
+        按粒度切分文本
+        
+        Returns:
+            [(片段内容, 起始位置, 结束位置), ...]
+        """
+        if self.granularity == GranularityLevel.SENTENCE:
+            # 按句子切分（支持中英文标点）
+            pattern = r'[^。！？.!?]+[。！？.!?]*'
+            matches = list(re.finditer(pattern, text))
+            return [(m.group().strip(), m.start(), m.end()) for m in matches if m.group().strip()]
+        
+        elif self.granularity == GranularityLevel.PARAGRAPH:
+            # 按段落切分（双换行或单换行）
+            paragraphs = re.split(r'\n\n|\n', text)
+            result = []
+            pos = 0
+            for para in paragraphs:
+                para = para.strip()
+                if para:
+                    result.append((para, pos, pos + len(para)))
+                    pos += len(para) + 2  # +2 for separator
+            return result
+        
+        else:  # FULL
+            return [(text, 0, len(text))]
+    
     def _calculate_importance(
         self,
         text: str,
@@ -241,60 +361,143 @@ class DynamicCompressor:
         total: int,
         query: str
     ) -> float:
-        """计算文本重要性分数"""
+        """
+        计算文本重要性分数
+        
+        权重分配：
+        - 内容重要性: CONTENT_IMPORTANCE_WEIGHT (默认0.7)
+          └─ 内部: 关键词匹配 60% + TF-IDF 40%
+        - 位置权重: POSITION_WEIGHT (默认0.2)
+        - 查询相关性: QUERY_WEIGHT (默认0.1)
+        """
         text_lower = text.lower()
         words = re.findall(r'\w+', text_lower)
         
         if not words:
             return 0.0
         
-        # 1. 关键词匹配分数 (40%)
+        # 1. 内容重要性评分 (合并关键词 + TF-IDF)
+        # 1.1 关键词匹配分数 (内部占60%)
         keyword_matches = sum(1 for kw in self.keywords if kw.lower() in text_lower)
-        keyword_score = min(keyword_matches / 3, 1.0) * 0.4
+        keyword_score = min(keyword_matches / 3, 1.0) * self._keyword_internal_ratio
         
-        # 2. TF-IDF 分数 (30%)
+        # 1.2 TF-IDF 分数 (内部占40%)
         word_count = Counter(words)
         if word_count:
             max_tf = max(word_count.values())
-            tf_score = (max_tf / len(words)) * 0.5 * 0.3
+            tfidf_score = (max_tf / len(words)) * 0.5 * self._tfidf_internal_ratio
         else:
-            tf_score = 0
+            tfidf_score = 0
         
-        # 3. 位置权重 (20%)
-        # 开头和结尾更重要
+        # 合并内容重要性
+        content_score = (keyword_score + tfidf_score) * self.content_importance_weight
+        
+        # 2. 位置权重（开头和结尾更重要）
         normalized_pos = position / max(total - 1, 1)
-        position_weight = 0.7 + 0.3 * (1 - abs(normalized_pos - 0.5) * 2)
-        position_score = position_weight * 0.2
+        position_factor = 0.7 + 0.3 * (1 - abs(normalized_pos - 0.5) * 2)
+        position_score = position_factor * self.position_weight
         
-        # 4. 查询相关性 (10%)
+        # 3. 查询相关性
         if query:
             query_words = set(re.findall(r'\w+', query.lower()))
             text_word_set = set(words)
             overlap = len(query_words & text_word_set)
-            query_score = (overlap / max(len(query_words), 1)) * 0.1
+            query_score = (overlap / max(len(query_words), 1)) * self.query_weight
         else:
-            query_score = 0.05
+            query_score = self.query_weight * 0.5  # 无查询时给一半基础分
         
-        return keyword_score + tf_score + position_score + query_score
+        return content_score + position_score + query_score
     
-    def _truncate_text(self, text: str, max_tokens: int) -> str:
-        """截断文本到指定 token 数"""
-        # 简单估算：1 token ≈ 4 字符（中文）或 1 单词（英文）
-        max_chars = max_tokens * 3
+    def _compress_text_granular(
+        self,
+        text: str,
+        max_tokens: int,
+        query: str
+    ) -> Tuple[str, int, int]:
+        """
+        细粒度压缩文本
+        
+        Returns:
+            (压缩后文本, 原始tokens, 压缩后tokens)
+        """
+        original_tokens = self.token_counter.count_tokens(text)
+        
+        if original_tokens <= max_tokens:
+            return text, original_tokens, original_tokens
+        
+        # 切分文本
+        segments = self._split_text(text)
+        if len(segments) <= self.min_keep_segments:
+            # 片段太少，直接截断
+            return self._truncate_text_to_tokens(text, max_tokens), original_tokens, max_tokens
+        
+        # 计算每个片段的重要性
+        scored_segments = []
+        for i, (seg_text, start, end) in enumerate(segments):
+            score = self._calculate_importance(seg_text, i, len(segments), query)
+            seg_tokens = self.token_counter.count_tokens(seg_text)
+            scored_segments.append({
+                'text': seg_text,
+                'score': score,
+                'tokens': seg_tokens,
+                'position': i
+            })
+        
+        # 按重要性排序
+        scored_segments.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 优先保留最重要的 min_keep_segments 个
+        selected = scored_segments[:self.min_keep_segments]
+        current_tokens = sum(s['tokens'] for s in selected)
+        
+        # 继续添加其他高分片段
+        remaining_budget = max_tokens - current_tokens
+        for seg in scored_segments[self.min_keep_segments:]:
+            if remaining_budget <= 0:
+                break
+            
+            if seg['tokens'] <= remaining_budget:
+                selected.append(seg)
+                remaining_budget -= seg['tokens']
+            else:
+                # 尝试部分保留（仅句子粒度）
+                if self.granularity == GranularityLevel.SENTENCE and remaining_budget > 20:
+                    truncated = self._truncate_text_to_tokens(seg['text'], remaining_budget)
+                    if truncated:
+                        selected.append({
+                            'text': truncated,
+                            'score': seg['score'],
+                            'tokens': self.token_counter.count_tokens(truncated),
+                            'position': seg['position']
+                        })
+                break
+        
+        # 按原始位置排序，恢复文本顺序
+        selected.sort(key=lambda x: x['position'])
+        
+        # 组合结果
+        result_text = ' '.join(s['text'] for s in selected)
+        compressed_tokens = self.token_counter.count_tokens(result_text)
+        
+        return result_text, original_tokens, compressed_tokens
+    
+    def _truncate_text_to_tokens(self, text: str, max_tokens: int) -> str:
+        """将文本截断到指定token数"""
+        max_chars = int(max_tokens * 3)  # 粗略估算
         
         if len(text) <= max_chars:
             return text
         
-        # 在句子边界截断
         truncated = text[:max_chars]
-        last_period = truncated.rfind('。')
-        last_newline = truncated.rfind('\n')
-        
-        cut_point = max(last_period, last_newline)
-        if cut_point > max_chars * 0.7:
-            return truncated[:cut_point + 1]
+        # 在句子边界截断
+        for punct in ['。', '！', '？', '.', '!', '?', '\n']:
+            idx = truncated.rfind(punct)
+            if idx > max_chars * 0.6:  # 至少保留60%
+                return truncated[:idx + 1]
         
         return truncated
+    
+
     
     def _summarize_history(self, history: List[Dict[str, str]]) -> str:
         """摘要历史对话"""

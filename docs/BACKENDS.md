@@ -73,7 +73,7 @@ VLLM_PREFIX_CACHING=true
 ```
 
 ```bash
-docker-compose up -d kvcache-dynamic-proxy
+docker-compose up -d kvcache-proxy
 ```
 
 ### 使用 Docker Compose Profile
@@ -247,7 +247,7 @@ export TARGET_URL="http://localhost:8002/v1"
 export LMDEPLOY_CACHE_ENTRIES=2000
 
 # 重启服务
-docker-compose restart kvcache-dynamic-proxy
+docker-compose restart kvcache-proxy
 ```
 
 ---

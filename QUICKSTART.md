@@ -20,7 +20,7 @@ cp .env.example .env
 ### 3. 启动
 
 ```bash
-kvcache-dynamic-proxy
+kvcache-proxy
 ```
 
 或使用 Python：

@@ -48,7 +48,7 @@ export API_KEY="your-openai-api-key"
 export TARGET_URL="https://api.openai.com/v1"
 
 # 启动
-kvcache-dynamic-proxy
+kvcache-proxy
 ```
 
 或使用 Python：
@@ -138,7 +138,7 @@ if hasattr(response, 'compression'):
 | `HISTORY_TARGET` | 历史压缩目标 tokens | `1000` |
 | `HISTORY_KEEP_LAST_N` | 历史对话保留轮数 | `4` |
 | `ENABLE_KV_CACHE` | 启用 KV Cache | `true` |
-| `KV_CACHE_SIZE` | KV Cache 大小 | `1000` |
+| `KV_CACHE_SIZE` | KV Cache 大小 | `2000` |
 | `HOST` | 服务监听地址 | `0.0.0.0` |
 | `PORT` | 服务端口 | `8000` |
 
@@ -157,7 +157,9 @@ config = ProxyConfig(
     history_keep_last_n=4,
     similarity_threshold=0.55,
     enable_kv_cache=True,
-    kv_cache_size=1000,
+    kv_cache_size=2000,
+    kv_cache_enable_compression=True,
+    kv_cache_hot_ratio=0.2,
     # 后端特定配置
     vllm_prefix_caching=True,
     sglang_radix_cache=True,
@@ -207,17 +209,97 @@ curl http://localhost:8000/metrics
 
 ## 🐳 Docker 部署
 
+### 快速启动
+
+```bash
+# 1. 复制环境变量模板
+cp .env.example .env
+
+# 2. 编辑 .env 文件，设置你的 API_KEY
+vim .env
+
+# 3. 使用脚本启动
+./start.sh start
+
+# 或使用 Docker Compose 直接启动
+docker-compose up -d
+```
+
+### Docker 命令行部署
+
 ```bash
 # 构建镜像
-docker build -t kvcache-dynamic-proxy .
+docker build -t kvcache-proxy .
 
-# 运行
+# 运行（带完整环境变量）
 docker run -d \
+  --name kvcache-proxy \
   -p 8000:8000 \
   -e API_KEY="your-api-key" \
   -e TARGET_URL="https://api.openai.com/v1" \
-  kvcache-dynamic-proxy
+  -e MODEL="gpt-4o-mini" \
+  -e ENABLE_COMPRESSION="true" \
+  -e MEMORIES_TARGET="1500" \
+  -e HISTORY_TARGET="1000" \
+  -e HISTORY_KEEP_LAST_N="4" \
+  -e ENABLE_KV_CACHE="true" \
+  kvcache-proxy
 ```
+
+### 环境变量配置
+
+#### OpenAI 协议三要素
+
+| 变量名 | 说明 | 默认值 | 必填 |
+|--------|------|--------|------|
+| `API_KEY` | 大模型 API 密钥 | - | ✅ |
+| `TARGET_URL` / `BASE_URL` | 目标服务地址 | `https://api.openai.com/v1` | ✅ |
+| `MODEL` | 默认模型名称 | `gpt-4o-mini` | ❌ |
+
+#### 压缩系数配置
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `ENABLE_COMPRESSION` | 是否启用动态压缩 | `true` |
+| `MEMORIES_TARGET` | Memories 压缩目标 Token 数 | `1500` |
+| `HISTORY_TARGET` | History 压缩目标 Token 数 | `1000` |
+| `HISTORY_KEEP_LAST_N` | 历史对话保留轮数 | `4` |
+
+#### 动态压缩算法参数
+
+| 变量名 | 说明 | 默认值 | 范围 |
+|--------|------|--------|------|
+| `SIMILARITY_THRESHOLD` | 相似度阈值（值越高压缩越严格） | `0.55` | 0.0-1.0 |
+| `SESSION_LEN` | 会话长度限制 | `8192` | - |
+| `USE_FAST_MODE` | 快速压缩模式（牺牲压缩率换速度） | `false` | true/false |
+
+#### KV Cache 基础配置
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `ENABLE_KV_CACHE` | 是否启用 KV Cache | `true` |
+| `KV_CACHE_SIZE` | 缓存最大条目数 | `2000` |
+| `KV_CACHE_TTL` | 缓存过期时间（秒） | `3600` |
+| `VLLM_PREFIX_CACHING` | vLLM 前缀缓存 | `true` |
+| `SGLANG_RADIX_CACHE` | SGLang RadixAttention | `true` |
+| `LMDEPLOY_CACHE_ENTRIES` | LMDeploy 缓存条目 | `1000` |
+
+#### KV Cache 高性价比优化参数
+
+| 变量名 | 说明 | 默认值 | 效果 |
+|--------|------|--------|------|
+| `KV_CACHE_COMPRESSION` | 启用内存压缩 | `true` | 节省 50-70% 内存 |
+| `KV_CACHE_COMPRESSION_THRESHOLD` | 压缩阈值（字节） | `1024` | >1KB 才压缩 |
+| `KV_CACHE_HOT_RATIO` | 热点数据常驻比例 | `0.2` | 20% 数据常驻 |
+| `KV_CACHE_ADAPTIVE_TTL` | 自适应 TTL | `true` | 动态调整过期时间 |
+| `KV_CACHE_MIN_TTL` | 最小 TTL（秒） | `300` | 不低于 5 分钟 |
+| `KV_CACHE_MAX_TTL` | 最大 TTL（秒） | `7200` | 不超过 2 小时 |
+
+**优化策略说明：**
+1. **内存压缩**：对冷数据启用 gzip 压缩，内存占用降低 50-70%，CPU 开销 < 5%
+2. **热点常驻**：高频访问数据（20%）保留在内存，不被淘汰，命中率提升 15-30%
+3. **自适应 TTL**：根据命中率动态调整过期时间，平衡内存和命中率
+4. **分层缓存**：L1（热点，未压缩）+ L2（普通，可能压缩）
 
 ### Docker Compose
 
@@ -229,11 +311,26 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # OpenAI 协议三要素
       - API_KEY=${API_KEY}
-      - TARGET_URL=${TARGET_URL}
-      - BACKEND_TYPE=${BACKEND_TYPE:-openai}
-      - ENABLE_COMPRESSION=true
-      - MEMORIES_TARGET=1500
+      - TARGET_URL=${TARGET_URL:-https://api.openai.com/v1}
+      - MODEL=${MODEL:-gpt-4o-mini}
+      
+      # 压缩配置
+      - ENABLE_COMPRESSION=${ENABLE_COMPRESSION:-true}
+      - MEMORIES_TARGET=${MEMORIES_TARGET:-1500}
+      - HISTORY_TARGET=${HISTORY_TARGET:-1000}
+      - HISTORY_KEEP_LAST_N=${HISTORY_KEEP_LAST_N:-4}
+      
+      # KV Cache 基础配置
+      - ENABLE_KV_CACHE=${ENABLE_KV_CACHE:-true}
+      - KV_CACHE_SIZE=${KV_CACHE_SIZE:-2000}
+      - KV_CACHE_TTL=${KV_CACHE_TTL:-3600}
+      
+      # KV Cache 高性价比优化
+      - KV_CACHE_COMPRESSION=${KV_CACHE_COMPRESSION:-true}
+      - KV_CACHE_HOT_RATIO=${KV_CACHE_HOT_RATIO:-0.2}
+      - KV_CACHE_ADAPTIVE_TTL=${KV_CACHE_ADAPTIVE_TTL:-true}
 ```
 
 ---

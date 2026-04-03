@@ -21,14 +21,10 @@ from .metrics import MetricsCollector
 
 class ProxyConfig(BaseModel):
     """代理配置"""
-    # 目标后端配置（支持环境变量覆盖）
+    # 目标服务配置（支持环境变量覆盖）
     target_url: str = Field(
         default="https://api.openai.com/v1",
-        description="目标模型服务地址 (env: TARGET_URL)"
-    )
-    backend_type: str = Field(
-        default="openai",
-        description="后端类型: openai|vllm|sglang|lmdeploy (env: BACKEND_TYPE)"
+        description="目标模型服务地址 (env: TARGET_URL / BASE_URL)"
     )
     api_key: Optional[str] = Field(default=None, description="API Key (env: API_KEY)")
     
@@ -37,17 +33,33 @@ class ProxyConfig(BaseModel):
     memories_target_tokens: int = Field(default=1500, description="env: MEMORIES_TARGET")
     history_target_tokens: int = Field(default=1000, description="env: HISTORY_TARGET")
     history_keep_last_n: int = Field(default=4, description="历史对话保留轮数 (env: HISTORY_KEEP_LAST_N)")
-    similarity_threshold: float = Field(default=0.55)
     
-    # KV Cache 配置
+    # 动态压缩算法参数
+    similarity_threshold: float = Field(default=0.55, description="相似度阈值 (env: SIMILARITY_THRESHOLD)")
+    session_len: int = Field(default=8192, description="会话长度限制 (env: SESSION_LEN)")
+    use_fast_mode: bool = Field(default=False, description="快速压缩模式 (env: USE_FAST_MODE)")
+    
+    # 细粒度压缩参数
+    compression_granularity: str = Field(default="paragraph", description="压缩粒度: full/paragraph/sentence (env: COMPRESSION_GRANULARITY)")
+    min_keep_segments: int = Field(default=1, description="每个记忆最少保留的片段数 (env: MIN_KEEP_SEGMENTS)")
+    
+    # 重要性评分权重（总和应为1.0）
+    content_importance_weight: float = Field(default=0.7, description="内容重要性权重 0-1，内部:关键词60%+TF-IDF40% (env: CONTENT_IMPORTANCE_WEIGHT)")
+    position_weight: float = Field(default=0.2, description="位置权重 0-1 (env: POSITION_WEIGHT)")
+    query_weight: float = Field(default=0.1, description="查询相关性权重 0-1 (env: QUERY_WEIGHT)")
+    
+    # KV Cache 基础配置
     enable_kv_cache: bool = Field(default=True, description="env: ENABLE_KV_CACHE")
-    kv_cache_size: int = Field(default=1000, description="env: KV_CACHE_SIZE")
+    kv_cache_size: int = Field(default=2000, description="env: KV_CACHE_SIZE (默认2000，配合压缩实际内存占用≈1000)")
     kv_cache_ttl: int = Field(default=3600, description="env: KV_CACHE_TTL")
     
-    # 后端特定 KV Cache 配置
-    vllm_prefix_caching: bool = Field(default=True, description="vLLM 前缀缓存 (env: VLLM_PREFIX_CACHING)")
-    sglang_radix_cache: bool = Field(default=True, description="SGLang RadixAttention (env: SGLANG_RADIX_CACHE)")
-    lmdeploy_cache_max_entries: int = Field(default=1000, description="LMDeploy 缓存条目 (env: LMDEPLOY_CACHE_ENTRIES)")
+    # 高性价比 KV Cache 优化参数
+    kv_cache_enable_compression: bool = Field(default=True, description="启用内存压缩 (env: KV_CACHE_COMPRESSION)")
+    kv_cache_compression_threshold: int = Field(default=1024, description="压缩阈值字节 (env: KV_CACHE_COMPRESSION_THRESHOLD)")
+    kv_cache_hot_ratio: float = Field(default=0.2, description="热点数据比例 0-1 (env: KV_CACHE_HOT_RATIO)")
+    kv_cache_adaptive_ttl: bool = Field(default=True, description="自适应TTL (env: KV_CACHE_ADAPTIVE_TTL)")
+    kv_cache_min_ttl: int = Field(default=300, description="最小TTL秒 (env: KV_CACHE_MIN_TTL)")
+    kv_cache_max_ttl: int = Field(default=7200, description="最大TTL秒 (env: KV_CACHE_MAX_TTL)")
     
     # 请求配置
     timeout: float = Field(default=60.0)
@@ -60,18 +72,29 @@ class ProxyConfig(BaseModel):
         import os
         
         return cls(
-            target_url=os.getenv("TARGET_URL", "https://api.openai.com/v1"),
-            backend_type=os.getenv("BACKEND_TYPE", "openai"),
+            target_url=os.getenv("TARGET_URL", os.getenv("BASE_URL", "https://api.openai.com/v1")),
             api_key=os.getenv("API_KEY"),
             enable_compression=os.getenv("ENABLE_COMPRESSION", "true").lower() == "true",
             memories_target_tokens=int(os.getenv("MEMORIES_TARGET", "1500")),
             history_target_tokens=int(os.getenv("HISTORY_TARGET", "1000")),
+            history_keep_last_n=int(os.getenv("HISTORY_KEEP_LAST_N", "4")),
+            similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.55")),
+            session_len=int(os.getenv("SESSION_LEN", "8192")),
+            use_fast_mode=os.getenv("USE_FAST_MODE", "false").lower() == "true",
+            compression_granularity=os.getenv("COMPRESSION_GRANULARITY", "paragraph"),
+            min_keep_segments=int(os.getenv("MIN_KEEP_SEGMENTS", "1")),
+            content_importance_weight=float(os.getenv("CONTENT_IMPORTANCE_WEIGHT", "0.7")),
+            position_weight=float(os.getenv("POSITION_WEIGHT", "0.2")),
+            query_weight=float(os.getenv("QUERY_WEIGHT", "0.1")),
             enable_kv_cache=os.getenv("ENABLE_KV_CACHE", "true").lower() == "true",
-            kv_cache_size=int(os.getenv("KV_CACHE_SIZE", "1000")),
+            kv_cache_size=int(os.getenv("KV_CACHE_SIZE", "2000")),
             kv_cache_ttl=int(os.getenv("KV_CACHE_TTL", "3600")),
-            vllm_prefix_caching=os.getenv("VLLM_PREFIX_CACHING", "true").lower() == "true",
-            sglang_radix_cache=os.getenv("SGLANG_RADIX_CACHE", "true").lower() == "true",
-            lmdeploy_cache_max_entries=int(os.getenv("LMDEPLOY_CACHE_ENTRIES", "1000")),
+            kv_cache_enable_compression=os.getenv("KV_CACHE_COMPRESSION", "true").lower() == "true",
+            kv_cache_compression_threshold=int(os.getenv("KV_CACHE_COMPRESSION_THRESHOLD", "1024")),
+            kv_cache_hot_ratio=float(os.getenv("KV_CACHE_HOT_RATIO", "0.2")),
+            kv_cache_adaptive_ttl=os.getenv("KV_CACHE_ADAPTIVE_TTL", "true").lower() == "true",
+            kv_cache_min_ttl=int(os.getenv("KV_CACHE_MIN_TTL", "300")),
+            kv_cache_max_ttl=int(os.getenv("KV_CACHE_MAX_TTL", "7200")),
         )
 
 
@@ -100,15 +123,25 @@ class CompressionProxy:
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.compressor = DynamicCompressor(
-            similarity_threshold=config.similarity_threshold
+            similarity_threshold=config.similarity_threshold,
+            session_len=config.session_len,
+            use_fast_mode=config.use_fast_mode,
+            granularity=config.compression_granularity,
+            min_keep_segments=config.min_keep_segments,
+            keyword_weight=config.content_importance_weight * 0.6,
+            tfidf_weight=config.content_importance_weight * 0.4,
+            position_weight=config.position_weight,
+            query_weight=config.query_weight
         )
         self.cache_manager = KVCacheManager(
-            backend_type=config.backend_type,
             max_size=config.kv_cache_size,
             ttl_seconds=config.kv_cache_ttl,
-            vllm_prefix_caching=config.vllm_prefix_caching,
-            sglang_radix_cache=config.sglang_radix_cache,
-            lmdeploy_max_entries=config.lmdeploy_cache_max_entries
+            enable_compression=config.kv_cache_enable_compression,
+            compression_threshold=config.kv_cache_compression_threshold,
+            hot_data_ratio=config.kv_cache_hot_ratio,
+            adaptive_ttl=config.kv_cache_adaptive_ttl,
+            min_ttl=config.kv_cache_min_ttl,
+            max_ttl=config.kv_cache_max_ttl
         ) if config.enable_kv_cache else None
         self.metrics = MetricsCollector()
         
